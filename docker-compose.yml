@@ -13,6 +13,7 @@ services:
       DOCKER_INFLUXDB_INIT_PASSWORD: weatherpass
       DOCKER_INFLUXDB_INIT_ORG: weather
       DOCKER_INFLUXDB_INIT_BUCKET: weather
+      DOCKER_INFLUXDB_INIT_RETENTION: 730d
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: weather-station-token
 
   grafana:
