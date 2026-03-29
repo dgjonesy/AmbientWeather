@@ -14,6 +14,7 @@ Setup:
 Run:
   python weather.py
   python weather.py --debug
+  python weather.py --influxdb
   python weather.py --host 0.0.0.0 --port 9090
 """
 
@@ -48,6 +49,63 @@ console = Console()
 # Shared state: latest weather data from the station
 _lock = threading.Lock()
 _latest_data: dict | None = None
+_influx_writer = None  # Set in main() if --influxdb is used
+
+
+# ---------------------------------------------------------------------------
+# InfluxDB integration
+# ---------------------------------------------------------------------------
+
+# Fields to write as InfluxDB float/int measurements
+INFLUX_FLOAT_FIELDS = {
+    "tempf", "tempinf", "dewPoint", "dewPointin", "feelsLike", "feelsLikein",
+    "windspeedmph", "windgustmph", "maxdailygust", "windspdmph_avg2m",
+    "windspdmph_avg10m", "baromrelin", "baromabsin", "solarradiation",
+    "hourlyrainin", "dailyrainin", "weeklyrainin", "monthlyrainin",
+    "yearlyrainin", "eventrainin", "totalrainin", "24hourrainin",
+}
+INFLUX_INT_FIELDS = {
+    "winddir", "humidity", "humidityin", "uv", "battout", "battin",
+}
+
+
+def init_influx_writer(url: str, token: str, org: str, bucket: str):
+    """Initialize the InfluxDB write client. Returns the (client, write_api) tuple."""
+    from influxdb_client import InfluxDBClient
+    from influxdb_client.client.write_api import SYNCHRONOUS
+    client = InfluxDBClient(url=url, token=token, org=org)
+    write_api = client.write_api(write_options=SYNCHRONOUS)
+    return client, write_api, bucket, org
+
+
+def write_to_influx(data: dict) -> None:
+    """Write a weather data point to InfluxDB."""
+    global _influx_writer
+    if _influx_writer is None:
+        return
+
+    from influxdb_client import Point
+    client, write_api, bucket, org = _influx_writer
+
+    point = Point("weather")
+    mac = data.get("MAC", "unknown")
+    point.tag("station", mac)
+
+    for key in INFLUX_FLOAT_FIELDS:
+        val = data.get(key)
+        if val is not None and isinstance(val, (int, float)):
+            point.field(key, float(val))
+
+    for key in INFLUX_INT_FIELDS:
+        val = data.get(key)
+        if val is not None and isinstance(val, (int, float)):
+            point.field(key, int(val))
+
+    try:
+        write_api.write(bucket=bucket, org=org, record=point)
+        log.debug("InfluxDB write OK")
+    except Exception as exc:
+        log.error("InfluxDB write failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +238,8 @@ class WeatherHandler(BaseHTTPRequestHandler):
 
         with _lock:
             _latest_data = data
+
+        write_to_influx(data)
 
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
@@ -414,9 +474,13 @@ def parse_args() -> argparse.Namespace:
             "  Interval:  60 seconds\n"
             "\n"
             "Environment variables (override defaults):\n"
-            "  LISTEN_HOST   listen address  (default: 0.0.0.0)\n"
-            "  LISTEN_PORT   listen port     (default: 8080)\n"
-            "  LOG_FILE      debug log path  (default: weather_debug.log)\n"
+            "  LISTEN_HOST       listen address       (default: 0.0.0.0)\n"
+            "  LISTEN_PORT       listen port          (default: 8080)\n"
+            "  LOG_FILE          debug log path       (default: weather_debug.log)\n"
+            "  INFLUXDB_URL      InfluxDB URL         (default: http://localhost:8086)\n"
+            "  INFLUXDB_TOKEN    InfluxDB auth token\n"
+            "  INFLUXDB_ORG      InfluxDB org          (default: weather)\n"
+            "  INFLUXDB_BUCKET   InfluxDB bucket       (default: weather)\n"
         ),
     )
     parser.add_argument(
@@ -434,6 +498,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-file", default=os.environ.get("LOG_FILE", "weather_debug.log"),
         help="debug log file path (default: weather_debug.log)",
+    )
+    parser.add_argument(
+        "--influxdb", action="store_true",
+        help="enable writing data to InfluxDB",
+    )
+    parser.add_argument(
+        "--influxdb-url",
+        default=os.environ.get("INFLUXDB_URL", "http://localhost:8086"),
+        help="InfluxDB URL (default: http://localhost:8086)",
+    )
+    parser.add_argument(
+        "--influxdb-token",
+        default=os.environ.get("INFLUXDB_TOKEN", ""),
+        help="InfluxDB auth token (or set INFLUXDB_TOKEN env var)",
+    )
+    parser.add_argument(
+        "--influxdb-org",
+        default=os.environ.get("INFLUXDB_ORG", "weather"),
+        help="InfluxDB organization (default: weather)",
+    )
+    parser.add_argument(
+        "--influxdb-bucket",
+        default=os.environ.get("INFLUXDB_BUCKET", "weather"),
+        help="InfluxDB bucket (default: weather)",
     )
     return parser.parse_args()
 
@@ -456,6 +544,23 @@ def main() -> None:
         logging.disable(logging.CRITICAL)
 
     log.info("=== Weather receiver starting on %s:%d ===", args.host, args.port)
+
+    if args.influxdb:
+        global _influx_writer
+        if not args.influxdb_token:
+            console.print(
+                "[bold red]Error:[/] --influxdb requires a token. "
+                "Set --influxdb-token or INFLUXDB_TOKEN env var."
+            )
+            sys.exit(1)
+        _influx_writer = init_influx_writer(
+            args.influxdb_url, args.influxdb_token,
+            args.influxdb_org, args.influxdb_bucket,
+        )
+        console.print(
+            f"[bold green]InfluxDB:[/] writing to {args.influxdb_url} "
+            f"org=[bold]{args.influxdb_org}[/] bucket=[bold]{args.influxdb_bucket}[/]"
+        )
 
     server = HTTPServer((args.host, args.port), WeatherHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
